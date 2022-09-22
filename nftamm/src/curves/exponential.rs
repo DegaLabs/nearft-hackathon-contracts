@@ -45,8 +45,7 @@ pub(crate) fn get_buy_info(
         };
     }
 
-    let delta_pow_n = U256::from(delta) * U256::from(num_items) / WAD;
-
+    let delta_pow_n = fpow(U256::from(delta), num_items, U256::from(WAD));
 
     let new_spot_rice = U256::from(spot_price) * delta_pow_n / WAD;
 

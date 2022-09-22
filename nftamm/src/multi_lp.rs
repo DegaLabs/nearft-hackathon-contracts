@@ -165,7 +165,7 @@ impl Contract {
     }
 
     pub fn lp_metadata(&self, pool_id: u64) -> FungibleTokenMetadata {
-        let decimals = 1u8;
+        let decimals = 24u8;
         FungibleTokenMetadata {
             // [AUDIT_08]
             spec: "nearft-lp-1.0.0".to_string(),

@@ -23,7 +23,7 @@ use near_sdk::collections::UnorderedMap;
 use near_sdk::json_types::U128;
 use near_sdk::{
     env, log, near_bindgen, require, AccountId, Balance, BorshStorageKey, Gas, PanicOnDefault,
-    Promise, StorageUsage,
+    Promise, StorageUsage, assert_one_yocto,
 };
 use pair::{Pair, PoolType};
 
@@ -205,7 +205,7 @@ impl Contract {
             fee.0,
             account_id.clone(),
             asset_recipient.clone(),
-            env::attached_deposit(),
+            0u128,
             locked_til,
             pool_id as u64,
         );
@@ -249,20 +249,31 @@ impl Contract {
         let pool = &mut self.pools[pool_id];
         pool.internal_register_account_lp(&account_id);
         log!("depositing near");
-        pool.deposit_token_ids_and_near(account_id.clone(), &initial_token_ids, &0u128);
-        pool.mint_lp(&account_id, 1);
+        pool.deposit_and_mint_lp(account_id.clone(), account_id.clone(), &initial_token_ids, &env::attached_deposit());
         self.assert_storage(&account_id, prev_storage, Some(0));
         log!("done assert storage");
         pool_id as u64
     }
 
     #[payable]
-    pub fn deposit_to_pool(&mut self, pool_id: u64, token_ids: Vec<TokenId>) {
+    pub fn add_liquidity(&mut self, pool_id: u64, token_ids: Vec<TokenId>) {
         let prev_storage = env::storage_usage();
         let account_id = env::predecessor_account_id();
         let pool = &mut self.pools[pool_id as usize];
-        pool.deposit_token_ids_and_near(account_id.clone(), &token_ids, &env::attached_deposit());
+        pool.deposit_and_mint_lp(account_id.clone(), account_id.clone(), &token_ids, &env::attached_deposit());
         self.assert_storage(&account_id, prev_storage, Some(0));
+    }
+
+    #[payable]
+    pub fn remove_liquidity(&mut self, pool_id: u64, lp: U128) {
+        assert_one_yocto();
+        let account_id = env::predecessor_account_id();
+        let nft_token = self.get_nft_asset_id(pool_id);
+        let pool = &mut self.pools[pool_id as usize];
+        let (protocol_fee, withdrawnable_near, token_ids) = pool.burn_lp(&account_id, lp.0, self.protocol_fee_multiplier);
+        self.protocol_fee_credit += protocol_fee;
+        Promise::new(account_id.clone()).transfer(withdrawnable_near);
+        self.transfer_nfts(&account_id, &nft_token, &token_ids);
     }
 
     #[payable]
@@ -273,9 +284,7 @@ impl Contract {
         pool.withdraw_near(&near_amount.0);
         self.assert_storage(&account_id, prev_storage, Some(env::attached_deposit()));
 
-        if env::attached_deposit() > 0 {
-            Promise::new(account_id.clone()).transfer(env::attached_deposit());
-        }
+        Promise::new(account_id.clone()).transfer(near_amount.0);
     }
 
     #[payable]

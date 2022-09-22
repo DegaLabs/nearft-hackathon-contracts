@@ -1,5 +1,5 @@
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::{UnorderedMap, LookupMap};
+use near_sdk::collections::{UnorderedMap};
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{env, require, AccountId, Balance, PanicOnDefault, near_bindgen};
 
@@ -7,7 +7,7 @@ use near_contract_standards::non_fungible_token::TokenId;
 
 use crate::curves::curve::{BondingCurve, Curve};
 use crate::curves::errorcodes::CurveErrorCode;
-use crate::curves::U256;
+use crate::curves::{U256, WAD};
 use crate::{AssetId, StorageKey};
 
 pub const MAX_FEE: u128 = 9 * (10u128.pow(17)); //max 90%
@@ -117,12 +117,16 @@ impl Pair {
         this
     }
 
-    pub fn deposit_token_ids_and_near(
+    pub fn deposit_and_mint_lp(
         &mut self,
         depositor: AccountId,
+        receiver_id: AccountId,
         token_ids: &Vec<TokenId>,
         near_balance: &Balance,
     ) {
+        if self.pool_type == PoolType::Trade {
+            require!(token_ids.len() as u128 * self.spot_price <= near_balance.clone(), "invalid added liquidity");
+        }
         for token_id in token_ids {
             self.token_ids_in_pools.insert(
                 token_id,
@@ -133,9 +137,34 @@ impl Pair {
             );
         }
         self.near_balance += near_balance;
+
+        // compute LP
+
+        let mut lp_amount = self.near_balance;
+        if self.lp_supply != 0 && !self.token_ids_in_pools.is_empty() {
+            lp_amount = self.lp_supply * token_ids.len() as u128 / self.token_ids_in_pools.len() as u128;
+        }
+        self.mint_lp(&receiver_id, lp_amount);
+    }
+
+    fn internal_add_token_ids(
+        &mut self,
+        depositor: AccountId,
+        token_ids: &Vec<TokenId>
+    ) {
+        for token_id in token_ids {
+            self.token_ids_in_pools.insert(
+                token_id,
+                &DepositedToken {
+                    depositor: depositor.clone(),
+                    min_price: 0u128,
+                },
+            );
+        }
     }
 
     pub fn withdraw_near(&mut self, near_amount: &Balance) -> Balance {
+        require!(self.pool_type != PoolType::Trade, "not allowed to withdraw near directly from trading pool, need to burn lp token");
         self.assert_owner();
         self.assert_release();
         if self.near_balance > near_amount.clone() {
@@ -148,6 +177,7 @@ impl Pair {
     }
 
     pub fn withdraw_nfts(&mut self, token_ids: &Vec<TokenId>) {
+        require!(self.pool_type != PoolType::Trade, "not allowed to withdraw nfts directly from trading pool, need to burn lp token");
         self.assert_owner();
         self.assert_release();
         for token_id in token_ids {
@@ -265,7 +295,7 @@ impl Pair {
 
         if self.asset_recipient.is_none() {
             //trading
-            self.deposit_token_ids_and_near(env::predecessor_account_id(), nft_ids, &0u128);
+            self.internal_add_token_ids(env::predecessor_account_id(), nft_ids);
         }
 
         require!(output_amount >= min_near_out, "insufficient liquidity");
@@ -350,13 +380,70 @@ impl Pair {
         self.lp_balances.insert(&receiver_id, &(balance_out + amount));
     }
 
-    pub fn mint_lp(&mut self, account_id: &AccountId, lp: Balance) {
+    fn mint_lp(&mut self, account_id: &AccountId, lp: Balance) {
         if lp == 0 {
             return;
         }
         self.lp_supply += lp;
         let prev_value = self.lp_balances.get(account_id).unwrap_or(0);
         self.lp_balances.insert(account_id, &(prev_value + lp));
+    }
+
+    // the idea is if the amount of NFTs to withdraw is fraction, we round up the amount of NFT, and reduce the 
+    // corresponding value of the fraction portion in the amount in near to withdraw
+    pub fn burn_lp(&mut self, account_id: &AccountId, lp: Balance, protocol_fee_multiplier: u128) -> (Balance, Balance, Vec<TokenId>) {
+        if lp == 0u128 {
+            return (0, 0, vec![]);
+        }
+        
+        let prev_value = self.lp_balances.get(account_id).unwrap_or(0);
+        if lp > prev_value {
+            env::panic_str("insufficient lp");
+        }
+
+        // compute withdrawnable nfts and liquidity
+        let withdrawable_near = U256::from(self.token_ids_in_pools.len()) * U256::from(self.spot_price) * U256::from(lp) / U256::from(self.lp_supply);
+        let mut withdrawable_near = withdrawable_near.as_u128();
+        let mut num_nfts_to_withdraw = self.token_ids_in_pools.len() as u128 * lp / self.lp_supply;
+        let mut value_in_fraction_nft = 0u128;
+        if num_nfts_to_withdraw * self.lp_supply != lp * self.token_ids_in_pools.len() as u128 {
+            num_nfts_to_withdraw += 1;
+            let buy_info = self.curve.get_buy_info(
+                self.spot_price,
+                self.delta,
+                1,
+                self.fee,
+                protocol_fee_multiplier.clone(),
+            );
+            // num_nfts_to_withdraw - 1 nfts with current spot price
+            // the rounded up of fraction nft with spot price after buying 1 nft
+            value_in_fraction_nft = (num_nfts_to_withdraw - 1) * self.spot_price + 1 * buy_info.new_spot_price;
+            require!(value_in_fraction_nft >= withdrawable_near.clone(), "internal error in handling liquidity");
+            value_in_fraction_nft -= withdrawable_near.clone();
+        }
+
+        if value_in_fraction_nft > withdrawable_near {
+            // TODO: should we allow to withdraw in near only?
+            env::panic_str("cannot withdraw as liquidity value in near is too small compared to nft spot price");
+        }
+
+        // TODO: take fee 
+        withdrawable_near -= value_in_fraction_nft;
+
+        let token_ids = self
+            .token_ids_in_pools
+            .keys()
+            .take(num_nfts_to_withdraw as usize)
+            .collect::<Vec<TokenId>>();
+        for token_id in &token_ids {
+            self.token_ids_in_pools.remove(token_id);
+        }
+
+        self.lp_balances.insert(account_id, &(prev_value - lp));
+        self.lp_supply -= lp;
+        self.near_balance -= withdrawable_near.clone();
+        let protocol_fee = U256::from(withdrawable_near) * U256::from(protocol_fee_multiplier) / WAD;
+        (protocol_fee.as_u128(), withdrawable_near, token_ids)
     }
 
     pub fn internal_register_account_lp(& mut self, account_id: &AccountId) {
@@ -372,6 +459,10 @@ impl Pair {
         }
     }
 
+    fn assert_not_trading_pool(&self) {
+        assert!(self.pool_type != PoolType::Trade, "must not be trading pool");
+    }
+
     pub(crate) fn assert_release(&self) {
         let timestamp_sec = env::block_timestamp_ms() / 1000;
         require!(
@@ -382,22 +473,25 @@ impl Pair {
 
     pub fn change_spot_price(&mut self, new_spot_price: u128) {
         self.assert_owner();
+        self.assert_not_trading_pool();
         self.spot_price = new_spot_price;
     }
 
     pub fn change_delta(&mut self, new_delta: u128) {
         self.assert_owner();
+        self.assert_not_trading_pool();
         self.delta = new_delta;
     }
 
     pub fn change_fee(&mut self, new_fee: u128) {
         self.assert_owner();
+        self.assert_not_trading_pool();
         self.fee = new_fee;
     }
 
     pub fn change_asset_recipient(&mut self, new_asset_recipient: Option<AccountId>) {
         self.assert_owner();
-        require!(self.pool_type != PoolType::Trade, "not for trade pools");
+        self.assert_not_trading_pool();
         self.asset_recipient = new_asset_recipient;
     }
 }

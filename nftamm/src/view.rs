@@ -171,4 +171,9 @@ impl Contract {
     pub fn get_metadata(&self) -> MetaData {
         MetaData { governance_id: self.governance_id.clone(), protocol_fee_receiver_id: self.protocol_fee_receiver_id.clone(), protocol_fee_credit: self.protocol_fee_credit.into(), pools_acount: self.pools.len() as u64, protocol_fee_multiplier: self.protocol_fee_multiplier.into(), storage_per_account_creation: self.storage_per_account_creation, storage_per_nft_deposit: self.storage_per_nft_deposit, storage_per_pair_creation: self.storage_per_pair_creation }
     }
+
+    pub fn get_nft_asset_id(&self, pool_id: u64) -> AssetId {
+        let pool = self.pools.get(pool_id as usize).expect("pool id invalid");
+        pool.nft_token.clone()
+    }
 }

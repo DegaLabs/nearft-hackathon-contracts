@@ -98,11 +98,6 @@ impl Contract {
     //     }
     // }
 
-    fn get_nft_asset_id(&self, pool_id: u64) -> AssetId {
-        let pool = self.pools.get(pool_id as usize).expect("pool id invalid");
-        pool.nft_token.clone()
-    }
-
     fn internal_swap_with_action(
         &mut self,
         account_id: &AccountId,
